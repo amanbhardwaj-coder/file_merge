@@ -1,19 +1,23 @@
 import os
+import zipfile
 from io import BytesIO
 
 import pandas as pd
 import streamlit as st
 
 
-# -------------------------------------------------
-# Streamlit Config
-# -------------------------------------------------
-st.set_page_config(
-    page_title="Excel / CSV Multi-Sheet Merger",
-    layout="wide"
-)
+st.set_page_config(page_title="Excel / CSV Merger", layout="wide")
 
 st.title("Excel / CSV Multi-Sheet Merger")
+
+
+# -------------------------------------------------
+# Large file support note
+# -------------------------------------------------
+st.info(
+    "For 500 MB uploads, make sure `.streamlit/config.toml` has "
+    "`maxUploadSize = 500` and `maxMessageSize = 500`."
+)
 
 
 # -------------------------------------------------
@@ -21,12 +25,17 @@ st.title("Excel / CSV Multi-Sheet Merger")
 # -------------------------------------------------
 def clean_sheet_name(name):
     invalid_chars = ["\\", "/", "*", "[", "]", ":", "?"]
-    name = str(name)
+    name = str(name).strip()
 
     for ch in invalid_chars:
         name = name.replace(ch, "_")
 
     return name[:31] if name else "Sheet1"
+
+
+def normalize_columns(df):
+    df.columns = [str(col).strip() for col in df.columns]
+    return df
 
 
 def read_csv_safely(uploaded_file):
@@ -35,12 +44,22 @@ def read_csv_safely(uploaded_file):
     for encoding in encodings:
         try:
             uploaded_file.seek(0)
-            return pd.read_csv(uploaded_file, encoding=encoding)
+            return pd.read_csv(
+                uploaded_file,
+                encoding=encoding,
+                dtype=str,
+                low_memory=False
+            )
         except Exception:
             continue
 
     uploaded_file.seek(0)
-    return pd.read_csv(uploaded_file, encoding_errors="ignore")
+    return pd.read_csv(
+        uploaded_file,
+        dtype=str,
+        encoding_errors="ignore",
+        low_memory=False
+    )
 
 
 def get_file_sheets(uploaded_file):
@@ -49,6 +68,7 @@ def get_file_sheets(uploaded_file):
 
     if extension == ".csv":
         df = read_csv_safely(uploaded_file)
+        df = normalize_columns(df)
         sheet_name = os.path.splitext(file_name)[0]
         return {sheet_name: df}
 
@@ -57,18 +77,20 @@ def get_file_sheets(uploaded_file):
         excel = pd.ExcelFile(uploaded_file)
 
         sheets = {}
+
         for sheet in excel.sheet_names:
             uploaded_file.seek(0)
-            sheets[sheet] = pd.read_excel(uploaded_file, sheet_name=sheet)
+            df = pd.read_excel(
+                uploaded_file,
+                sheet_name=sheet,
+                dtype=str
+            )
+            df = normalize_columns(df)
+            sheets[sheet] = df
 
         return sheets
 
     return {}
-
-
-def normalize_columns(df):
-    df.columns = [str(col).strip() for col in df.columns]
-    return df
 
 
 def add_missing_columns(df1, df2):
@@ -87,8 +109,14 @@ def add_missing_columns(df1, df2):
 
 
 def append_merge(existing_df, new_df):
-    existing_df, new_df, all_columns = add_missing_columns(existing_df, new_df)
-    return pd.concat([existing_df, new_df], ignore_index=True)
+    existing_df, new_df, _ = add_missing_columns(existing_df, new_df)
+
+    merged = pd.concat(
+        [existing_df, new_df],
+        ignore_index=True
+    )
+
+    return merged.fillna("")
 
 
 def merge_using_common_column(existing_df, new_df, common_column):
@@ -103,8 +131,8 @@ def merge_using_common_column(existing_df, new_df, common_column):
 
     existing_df, new_df, all_columns = add_missing_columns(existing_df, new_df)
 
-    existing_df[common_column] = existing_df[common_column].astype(str).str.strip()
-    new_df[common_column] = new_df[common_column].astype(str).str.strip()
+    existing_df[common_column] = existing_df[common_column].fillna("").astype(str).str.strip()
+    new_df[common_column] = new_df[common_column].fillna("").astype(str).str.strip()
 
     merged = existing_df.merge(
         new_df,
@@ -124,18 +152,17 @@ def merge_using_common_column(existing_df, new_df, common_column):
             merged[col] = merged[col].fillna(merged[new_col])
             merged.drop(columns=[new_col], inplace=True)
 
-    return merged
+    return merged.fillna("")
 
 
 def create_excel_output(merged_sheets):
     output = BytesIO()
 
-    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+    with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
         used_sheet_names = set()
 
         for sheet_name, df in merged_sheets.items():
             safe_name = clean_sheet_name(sheet_name)
-
             original_name = safe_name
             counter = 1
 
@@ -146,7 +173,11 @@ def create_excel_output(merged_sheets):
 
             used_sheet_names.add(safe_name)
 
-            df.to_excel(writer, sheet_name=safe_name, index=False)
+            df.to_excel(
+                writer,
+                sheet_name=safe_name,
+                index=False
+            )
 
     output.seek(0)
     return output
@@ -156,8 +187,20 @@ def create_csv_output(df):
     return df.to_csv(index=False).encode("utf-8-sig")
 
 
+def create_zip_csv_output(merged_sheets):
+    zip_buffer = BytesIO()
+
+    with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zip_file:
+        for sheet_name, df in merged_sheets.items():
+            csv_data = df.to_csv(index=False).encode("utf-8-sig")
+            zip_file.writestr(f"{clean_sheet_name(sheet_name)}.csv", csv_data)
+
+    zip_buffer.seek(0)
+    return zip_buffer
+
+
 # -------------------------------------------------
-# Sidebar Options
+# Sidebar
 # -------------------------------------------------
 st.sidebar.header("Merge Settings")
 
@@ -178,21 +221,30 @@ if merge_type == "Merge using common column":
     ).strip()
 
 merge_same_sheet_names = st.sidebar.checkbox(
-    "Merge sheets with the same name together",
+    "Merge sheets with same name together",
     value=True
 )
 
-output_file_name = st.sidebar.text_input(
-    "Output Excel File Name",
-    value="merged_output.xlsx"
+download_format = st.sidebar.radio(
+    "Recommended download format",
+    [
+        "Excel workbook",
+        "CSV zip"
+    ],
+    index=1
 )
 
-if not output_file_name.endswith(".xlsx"):
-    output_file_name += ".xlsx"
+output_file_name = st.sidebar.text_input(
+    "Output File Name",
+    value="merged_output"
+).strip()
+
+if not output_file_name:
+    output_file_name = "merged_output"
 
 
 # -------------------------------------------------
-# File Upload
+# Upload
 # -------------------------------------------------
 uploaded_files = st.file_uploader(
     "Upload Excel or CSV files",
@@ -202,117 +254,163 @@ uploaded_files = st.file_uploader(
 
 
 # -------------------------------------------------
-# Main Logic
+# Main
 # -------------------------------------------------
-if uploaded_files:
-    if len(uploaded_files) < 2:
-        st.warning("Please upload at least two files.")
-        st.stop()
+if not uploaded_files:
+    st.warning("Upload two or more Excel/CSV files to start.")
+    st.stop()
 
-    if merge_type == "Merge using common column" and not common_column:
-        st.warning("Please enter the common column name.")
-        st.stop()
+if len(uploaded_files) < 2:
+    st.warning("Please upload at least two files.")
+    st.stop()
 
-    merged_sheets = {}
-    report_rows = []
+if merge_type == "Merge using common column" and not common_column:
+    st.warning("Please enter the common column name.")
+    st.stop()
 
-    with st.spinner("Merging files..."):
-        for uploaded_file in uploaded_files:
-            file_sheets = get_file_sheets(uploaded_file)
 
-            for sheet_name, df in file_sheets.items():
-                df = normalize_columns(df)
+merged_sheets = {}
+report_rows = []
 
-                if merge_same_sheet_names:
-                    output_sheet_name = sheet_name
-                else:
-                    base_file_name = os.path.splitext(uploaded_file.name)[0]
-                    output_sheet_name = f"{base_file_name}_{sheet_name}"
+progress = st.progress(0)
+status = st.empty()
 
-                rows_before = len(df)
+total_files = len(uploaded_files)
 
-                if output_sheet_name not in merged_sheets:
-                    if merge_type == "Merge using common column":
-                        if common_column not in df.columns:
-                            df[common_column] = ""
+for index, uploaded_file in enumerate(uploaded_files, start=1):
+    status.write(f"Reading: **{uploaded_file.name}**")
 
-                    merged_sheets[output_sheet_name] = df.copy()
+    file_sheets = get_file_sheets(uploaded_file)
 
-                else:
-                    existing_rows = len(merged_sheets[output_sheet_name])
+    for sheet_name, df in file_sheets.items():
+        file_base_name = os.path.splitext(uploaded_file.name)[0]
 
-                    if merge_type == "Append rows":
-                        merged_sheets[output_sheet_name] = append_merge(
-                            merged_sheets[output_sheet_name],
-                            df
-                        )
-                    else:
-                        merged_sheets[output_sheet_name] = merge_using_common_column(
-                            merged_sheets[output_sheet_name],
-                            df,
-                            common_column
-                        )
+        if merge_same_sheet_names:
+            output_sheet_name = sheet_name
+        else:
+            output_sheet_name = f"{file_base_name}_{sheet_name}"
 
-                    rows_after = len(merged_sheets[output_sheet_name])
+        rows_read = len(df)
+        columns_read = len(df.columns)
 
-                    report_rows.append({
-                        "File": uploaded_file.name,
-                        "Sheet": sheet_name,
-                        "Output Sheet": output_sheet_name,
-                        "Rows Read": rows_before,
-                        "Rows Before Merge": existing_rows,
-                        "Rows After Merge": rows_after,
-                        "Columns": len(df.columns)
-                    })
+        if output_sheet_name not in merged_sheets:
+            if merge_type == "Merge using common column":
+                if common_column not in df.columns:
+                    df[common_column] = ""
 
-    st.success("Files merged successfully!")
+            merged_sheets[output_sheet_name] = df.copy()
 
-    # -------------------------------------------------
-    # Preview
-    # -------------------------------------------------
-    st.subheader("Preview")
+            rows_before = 0
+            rows_after = len(df)
 
-    selected_sheet = st.selectbox(
-        "Select sheet",
-        list(merged_sheets.keys())
-    )
+        else:
+            rows_before = len(merged_sheets[output_sheet_name])
 
-    selected_df = merged_sheets[selected_sheet]
+            if merge_type == "Append rows":
+                merged_sheets[output_sheet_name] = append_merge(
+                    merged_sheets[output_sheet_name],
+                    df
+                )
+            else:
+                merged_sheets[output_sheet_name] = merge_using_common_column(
+                    merged_sheets[output_sheet_name],
+                    df,
+                    common_column
+                )
 
-    st.write(f"Rows: **{len(selected_df)}** | Columns: **{len(selected_df.columns)}**")
-    st.dataframe(selected_df.head(200), use_container_width=True)
+            rows_after = len(merged_sheets[output_sheet_name])
 
-    # -------------------------------------------------
-    # Download Excel
-    # -------------------------------------------------
+        report_rows.append({
+            "File": uploaded_file.name,
+            "Input Sheet": sheet_name,
+            "Output Sheet": output_sheet_name,
+            "Rows Read": rows_read,
+            "Columns Read": columns_read,
+            "Rows Before Merge": rows_before,
+            "Rows After Merge": rows_after
+        })
+
+    progress.progress(index / total_files)
+
+status.empty()
+progress.empty()
+
+st.success("Files merged successfully!")
+
+
+# -------------------------------------------------
+# Preview
+# -------------------------------------------------
+st.subheader("Preview")
+
+selected_sheet = st.selectbox(
+    "Select sheet",
+    list(merged_sheets.keys())
+)
+
+selected_df = merged_sheets[selected_sheet]
+
+st.write(
+    f"Rows: **{len(selected_df)}** | Columns: **{len(selected_df.columns)}**"
+)
+
+st.dataframe(
+    selected_df.head(200),
+    use_container_width=True
+)
+
+
+# -------------------------------------------------
+# Downloads
+# -------------------------------------------------
+st.subheader("Download")
+
+if download_format == "Excel workbook":
     excel_output = create_excel_output(merged_sheets)
 
     st.download_button(
         label="Download Merged Excel",
         data=excel_output,
-        file_name=output_file_name,
+        file_name=f"{output_file_name}.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
     )
 
-    # -------------------------------------------------
-    # Download Current Sheet as CSV
-    # -------------------------------------------------
-    csv_output = create_csv_output(selected_df)
+else:
+    zip_output = create_zip_csv_output(merged_sheets)
 
     st.download_button(
-        label="Download Selected Sheet as CSV",
-        data=csv_output,
-        file_name=f"{clean_sheet_name(selected_sheet)}.csv",
-        mime="text/csv"
+        label="Download Merged CSV ZIP",
+        data=zip_output,
+        file_name=f"{output_file_name}.zip",
+        mime="application/zip"
     )
 
-    # -------------------------------------------------
-    # Merge Report
-    # -------------------------------------------------
-    if report_rows:
-        st.subheader("Merge Report")
-        report_df = pd.DataFrame(report_rows)
-        st.dataframe(report_df, use_container_width=True)
 
-else:
-    st.info("Upload two or more Excel/CSV files to start.")
+csv_output = create_csv_output(selected_df)
+
+st.download_button(
+    label="Download Selected Sheet as CSV",
+    data=csv_output,
+    file_name=f"{clean_sheet_name(selected_sheet)}.csv",
+    mime="text/csv"
+)
+
+
+# -------------------------------------------------
+# Merge Report
+# -------------------------------------------------
+st.subheader("Merge Report")
+
+report_df = pd.DataFrame(report_rows)
+
+st.dataframe(
+    report_df,
+    use_container_width=True
+)
+
+st.download_button(
+    label="Download Merge Report CSV",
+    data=create_csv_output(report_df),
+    file_name="merge_report.csv",
+    mime="text/csv"
+)
